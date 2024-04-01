@@ -1,4 +1,7 @@
 const std = @import("std");
+
+const entry = @import("entry.zig");
+
 const IO_Uring = std.os.linux.IO_Uring;
 const iovec = std.os.iovec;
 
@@ -21,24 +24,28 @@ const QUEUE_DEPTH = 64;
 const BUFFER_SIZE = 512;
 
 const UserData = union(UserDataType) {
-    no_data: void,
     accept: std.net.Address,
     open: struct {
         from_fd: i32,
         to_fd: i32,
     },
-    splice_in: struct {
-        from_fd: i32,
-        to_fd: i32,
-        pipes: [2]std.os.fd_t,
-    },
+    splice_in: SpliceIn,
+    shutdown: SpliceIn,
+    term,
+};
+
+const SpliceIn = struct {
+    from_fd: i32,
+    to_fd: i32,
+    pipes: [2]std.os.fd_t,
 };
 
 const UserDataType = enum {
-    no_data,
     accept,
     open,
     splice_in,
+    shutdown,
+    term,
 };
 
 const ENTRY_SIZE = 10;
@@ -59,8 +66,6 @@ pub fn main() !void {
 
     const config = config_parsed.value;
 
-    std.log.info("{any}", .{config});
-
     var ring = try IO_Uring.init(QUEUE_DEPTH, 0);
     defer ring.deinit();
 
@@ -80,9 +85,10 @@ pub fn main() !void {
 
     try ring.register_buffers(iov);
 
-    for (config.endpoints, 0..) |endpoint, i| {
-        std.log.debug("{} : {any}", .{ i, endpoint });
+    var entry_list = try entry.entryList(UserData).init(allocator, 512);
+    defer entry_list.deinit();
 
+    for (config.endpoints) |endpoint| {
         const address = try getAddress(allocator, endpoint.from);
         const to_address = try getAddress(allocator, endpoint.to);
 
@@ -92,22 +98,38 @@ pub fn main() !void {
 
             try std.os.listen(socket, 10);
 
-            const data = try allocator.create(UserData);
-            data.* = UserData{ .accept = to_address };
+            const e_id = try entry_list.insert(UserData{ .accept = to_address });
 
-            std.log.info("{}", .{@as(u64, @intFromPtr(data))});
-
-            var sqe = try ring.accept(@as(u64, @intFromPtr(data)), socket, null, null, 0);
+            var sqe = try ring.accept(e_id, socket, null, null, 0);
             sqe.ioprio |= std.os.linux.IORING_ACCEPT_MULTISHOT;
         } else {
             std.log.warn("unsupported udp", .{});
         }
     }
 
-    var entry: u16 = 0;
+    var mask = std.os.linux.empty_sigset;
+    std.os.linux.sigaddset(&mask, std.os.linux.SIG.INT);
+    std.os.linux.sigaddset(&mask, std.os.linux.SIG.TERM);
+
+    const res = std.os.linux.sigprocmask(std.os.linux.SIG.BLOCK, &mask, null);
+    if (res < 0) {
+        std.log.err("sigprocmask failed : {}", .{std.os.linux.getErrno(res)});
+        return error.sigprocmaskFailed;
+    }
+
+    const sigfd = std.os.linux.signalfd(-1, &mask, 0);
+    if (sigfd < 0) {
+        std.log.err("signalfd failed : {}", .{std.os.linux.getErrno(res)});
+        return error.signalfd;
+    }
+    const stop_id = try entry_list.insert(UserData.term);
+
+    _ = try ring.poll_add(stop_id, @intCast(sigfd), std.os.linux.POLL.IN);
     _ = try ring.submit();
 
-    while (true) {
+    var stop = false;
+
+    while (!stop) {
         const count = ring.cq_ready();
         std.log.debug("ready {}", .{count});
 
@@ -118,63 +140,73 @@ pub fn main() !void {
                 var cqe = &ring.cq.cqes[head & ring.cq.mask];
                 head +%= 1;
 
-                const data: *UserData = @ptrFromInt(cqe.user_data);
+                const data: *UserData = try entry_list.getPtr(cqe.user_data);
 
-                std.log.info("{}", .{cqe});
+                std.log.debug("cqe = {}, user data = {}", .{ cqe, data });
+
                 if (cqe.res < 0) {
-                    std.log.err("async request failed : {}, {}", .{ data, cqe.err() });
+                    std.log.err("async request failed : {}", .{cqe.err()});
                     if (cqe.err() == .CANCELED) {} else {
                         return error.asyncRequestFailed;
                     }
                 }
 
-                std.log.info("{}", .{cqe});
-                std.log.info("{}", .{data});
-
                 switch (data.*) {
-                    UserData.no_data => {
-                        unreachable;
-                    },
                     UserData.accept => |address| {
                         std.log.debug("connecting to {}", .{address});
                         const socketfd = try std.os.socket(address.any.family, std.os.SOCK.STREAM, 0);
 
-                        const user_data = try allocator.create(UserData);
-                        user_data.* = UserData{ .open = .{ .from_fd = cqe.res, .to_fd = socketfd } };
+                        const e_id = try entry_list.insert(UserData{ .open = .{ .from_fd = cqe.res, .to_fd = socketfd } });
 
-                        _ = try ring.connect(@as(u64, @intFromPtr(user_data)), socketfd, &address.any, address.getOsSockLen());
+                        _ = try ring.connect(e_id, socketfd, &address.any, address.getOsSockLen());
                     },
                     UserData.open => |d| {
                         data.* = UserData{ .splice_in = .{ .from_fd = d.from_fd, .to_fd = d.to_fd, .pipes = try std.os.pipe() } };
 
-                        const user_data_to = try allocator.create(UserData);
-                        user_data_to.* = UserData{ .splice_in = .{ .from_fd = d.to_fd, .to_fd = d.from_fd, .pipes = try std.os.pipe() } };
+                        const user_data_to_id = try entry_list.insert(UserData{
+                            .splice_in = .{ .from_fd = d.to_fd, .to_fd = d.from_fd, .pipes = try std.os.pipe() },
+                        });
+
+                        const user_data_to = try entry_list.getPtr(user_data_to_id); // TODO
 
                         _ = std.os.linux.fcntl(data.splice_in.pipes[0], 1031, 4096);
-                        _ = try prepSplice(&ring, d.from_fd, -1, data.splice_in.pipes[1], -1, 4096, data);
+                        _ = try prepSplice(&ring, d.from_fd, -1, data.splice_in.pipes[1], -1, 4096, cqe.user_data);
 
                         _ = std.os.linux.fcntl(user_data_to.splice_in.pipes[0], 1031, 4096);
-                        _ = try prepSplice(&ring, d.to_fd, -1, user_data_to.splice_in.pipes[1], -1, 4096, user_data_to);
-
-                        entry += 1;
+                        _ = try prepSplice(&ring, d.to_fd, -1, user_data_to.splice_in.pipes[1], -1, 4096, user_data_to_id);
                     },
                     UserData.splice_in => |d| {
                         const size = cqe.res;
 
                         if (size == 0) {
+                            data.* = UserData{ .shutdown = d };
+                            const sqe_close1 = try ring.close(0, d.pipes[1]);
+                            sqe_close1.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
+                            const sqe_close2 = try ring.close(0, d.pipes[0]);
+                            sqe_close2.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
+                            _ = try ring.shutdown(cqe.user_data, d.to_fd, std.os.linux.SHUT.RDWR);
+
                             std.log.debug("connection closed", .{});
                         } else {
-                            var sqe = try prepSplice(&ring, d.pipes[0], -1, d.to_fd, -1, @intCast(size), data);
+                            var sqe = try prepSplice(&ring, d.pipes[0], -1, d.to_fd, -1, @intCast(size), cqe.user_data);
                             sqe.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
-                            _ = try prepSplice(&ring, d.from_fd, -1, d.pipes[1], -1, 4096, data);
+                            _ = try prepSplice(&ring, d.from_fd, -1, d.pipes[1], -1, 4096, cqe.user_data);
                         }
+                    },
+                    UserData.shutdown => {
+                        std.log.debug("connection closed", .{});
+                        entry_list.remove(cqe.user_data);
+                    },
+                    UserData.term => {
+                        stop = true;
                     },
                 }
             }
+
             ring.cq_advance(count);
             _ = try ring.submit();
         } else {
-            std.log.debug("waiting ...", .{});
+            std.log.debug("waiting for events", .{});
             _ = try ring.enter(0, 1, std.os.linux.IORING_ENTER_GETEVENTS);
         }
     }
@@ -190,13 +222,13 @@ fn getAddress(allocator: std.mem.Allocator, hostAndPort: []const u8) !std.net.Ad
     return address;
 }
 
-fn prepSplice(ring: *IO_Uring, from_fd: i32, from_offset: i64, to_fd: i32, to_offset: i64, len: u64, data: anytype) !*std.os.linux.io_uring_sqe {
+fn prepSplice(ring: *IO_Uring, from_fd: i32, from_offset: i64, to_fd: i32, to_offset: i64, len: u64, data: u64) !*std.os.linux.io_uring_sqe {
     var sqe = try ring.get_sqe();
     std.os.linux.io_uring_prep_rw(.SPLICE, sqe, to_fd, undefined, len, @bitCast(to_offset));
     sqe.splice_fd_in = from_fd;
     sqe.addr = @bitCast(from_offset); // splice_off_in
     //  sqe.rw_flags = SPLICE_F_MORE;
-    sqe.user_data = @as(u64, @intFromPtr(data));
+    sqe.user_data = data;
 
     return sqe;
 }
