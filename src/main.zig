@@ -30,7 +30,7 @@ const UserData = union(UserDataType) {
         to_fd: i32,
     },
     splice_in: SpliceIn,
-    shutdown: SpliceIn,
+    shutdown,
     term,
 };
 
@@ -146,9 +146,6 @@ pub fn main() !void {
 
                 if (cqe.res < 0) {
                     std.log.err("async request failed : {}", .{cqe.err()});
-                    if (cqe.err() == .CANCELED) {} else {
-                        return error.asyncRequestFailed;
-                    }
                 }
 
                 switch (data.*) {
@@ -161,30 +158,38 @@ pub fn main() !void {
                         _ = try ring.connect(e_id, socketfd, &address.any, address.getOsSockLen());
                     },
                     UserData.open => |d| {
-                        data.* = UserData{ .splice_in = .{ .from_fd = d.from_fd, .to_fd = d.to_fd, .pipes = try std.os.pipe() } };
+                        if (cqe.res < 0) {
+                            std.log.err("async request failed : {}", .{cqe.err()});
+                            data.* = UserData.shutdown;
+                            var sqe = try ring.close(cqe.user_data, d.from_fd);
+                            sqe.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
+                            _ = try ring.close(cqe.user_data, d.to_fd);
+                        } else {
+                            data.* = UserData{ .splice_in = .{ .from_fd = d.from_fd, .to_fd = d.to_fd, .pipes = try std.os.pipe() } };
 
-                        const user_data_to_id = try entry_list.insert(UserData{
-                            .splice_in = .{ .from_fd = d.to_fd, .to_fd = d.from_fd, .pipes = try std.os.pipe() },
-                        });
+                            const dest_to_source_pipes = try std.os.pipe();
 
-                        const user_data_to = try entry_list.getPtr(user_data_to_id); // TODO
+                            const user_data_to_id = try entry_list.insert(UserData{
+                                .splice_in = .{ .from_fd = d.to_fd, .to_fd = d.from_fd, .pipes = dest_to_source_pipes },
+                            });
 
-                        _ = std.os.linux.fcntl(data.splice_in.pipes[0], 1031, 4096);
-                        _ = try prepSplice(&ring, d.from_fd, -1, data.splice_in.pipes[1], -1, 4096, cqe.user_data);
+                            _ = std.os.linux.fcntl(data.splice_in.pipes[0], 1031, 4096);
+                            _ = try prepSplice(&ring, d.from_fd, -1, data.splice_in.pipes[1], -1, 4096, cqe.user_data);
 
-                        _ = std.os.linux.fcntl(user_data_to.splice_in.pipes[0], 1031, 4096);
-                        _ = try prepSplice(&ring, d.to_fd, -1, user_data_to.splice_in.pipes[1], -1, 4096, user_data_to_id);
+                            _ = std.os.linux.fcntl(dest_to_source_pipes[0], 1031, 4096);
+                            _ = try prepSplice(&ring, d.to_fd, -1, dest_to_source_pipes[1], -1, 4096, user_data_to_id);
+                        }
                     },
                     UserData.splice_in => |d| {
                         const size = cqe.res;
 
-                        if (size == 0) {
-                            data.* = UserData{ .shutdown = d };
+                        if (size <= 0) {
+                            data.* = UserData.shutdown;
                             const sqe_close1 = try ring.close(0, d.pipes[1]);
                             sqe_close1.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
                             const sqe_close2 = try ring.close(0, d.pipes[0]);
                             sqe_close2.flags |= std.os.linux.IOSQE_IO_LINK | std.os.linux.IOSQE_CQE_SKIP_SUCCESS;
-                            _ = try ring.shutdown(cqe.user_data, d.to_fd, std.os.linux.SHUT.RDWR);
+                            _ = try ring.close(cqe.user_data, d.to_fd);
 
                             std.log.debug("connection closed", .{});
                         } else {
